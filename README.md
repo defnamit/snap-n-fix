@@ -20,7 +20,7 @@ Snap 'n Fix is an autonomous, audio-triggered code repair tool that listens for 
 
 Error File-
 
-![Home Page](screenshots/d4.png)
+![Home Page](screenshots/d4.jpg)
 
 
 🛠️ Requirements & Prerequisites
