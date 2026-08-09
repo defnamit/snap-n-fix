@@ -20,8 +20,19 @@ Snap 'n Fix is an autonomous, audio-triggered code repair tool that listens for 
 
 Error File-
 
-![Home Page](screenshots/d4.jpg)
+![Error File](screenshots/d4.jpg)
 
+Snap Detection-
+
+![Snap Detection](screenshots/d3.jpg)
+
+Tokens Computation-
+
+![Tokens](screenshots/d2.jpg)
+
+Bug fixed-
+
+![Bug Fixed](screenshots/d3.jpg)
 
 🛠️ Requirements & Prerequisites
 Python 3.8+
