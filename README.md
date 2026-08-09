@@ -32,7 +32,7 @@ Tokens Computation-
 
 Bug fixed-
 
-![Bug Fixed](screenshots/d3.jpg)
+![Bug Fixed](screenshots/d1.jpg)
 
 🛠️ Requirements & Prerequisites
 Python 3.8+
