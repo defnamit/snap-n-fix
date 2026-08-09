@@ -18,6 +18,10 @@ Snap 'n Fix is an autonomous, audio-triggered code repair tool that listens for 
 🛡️ Safe Restores: Creates an automatic .bak backup before applying any AI-generated corrections.
 
 
+Error File-
+
+![Home Page](screenshots/d4.png)
+
 
 🛠️ Requirements & Prerequisites
 Python 3.8+
