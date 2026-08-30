@@ -34,6 +34,15 @@ Bug fixed-
 
 ![Bug Fixed](screenshots/d1.jpg)
 
+NEW UPDATES-
+I have implemented rag so as to divide whole of your code into chunks , embed them and then retrieve the updated code from the LLM , although rag makes the whole process less time taking and very quick.
+But i noticed some disparity , that was the rag is reading the whole code again and again which is already corrected and has no errors , this obviously increases the run time and also the load on GPU , to overcome this problem i used a checkpoint method.
+If the user has corrected the code up to line x , the next the user will snap the code will only be read after the line x , up to the latest saved line.
+Let us suppose the user updated some code beyond the checkpoint "x" , in that case the checkpoint will also move at that position where the code was last updated.
+This whole things make the process less time consuming and more user efficient.
+
+1 like = 1 lpa job , lol
+
 🛠️ Requirements & Prerequisites
 Python 3.8+
 
