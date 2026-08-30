@@ -2,7 +2,9 @@ import os
 import re
 import sys
 import glob
+import json
 import math
+import hashlib
 import shutil
 import subprocess
 import threading
@@ -70,6 +72,23 @@ RAG_TOP_K = 4               # how many chunks to inject into the prompt
 RAG_SCAN_SUBFOLDERS = True  # index the whole project tree, not just one folder
 RAG_MAX_FILE_BYTES = 200_000  # skip enormous files
 
+# --- Generation configuration ---
+# Hard ceiling on generated tokens. The actual cap sent per request is scaled
+# down from this based on how much code is in the window (see call_lm_studio_fix),
+# so a 10-line fix can't accidentally run all the way out to 4096 tokens just
+# because the model didn't stop cleanly.
+MAX_TOKENS_CEILING = 4096
+MAX_TOKENS_FLOOR = 300
+MAX_TOKENS_PER_LINE = 25
+
+# --- Incremental checkpoint configuration ---
+# After each snap, remember how far Gemma has already seen/fixed. The next snap
+# only sends NEW lines after that point (up to CHECKPOINT_MAX_LINES), so the
+# model never has to re-read the whole file.
+CHECKPOINT_ENABLED = True
+CHECKPOINT_MAX_LINES = 100   # max lines sent to Gemma per snap
+CHECKPOINT_STORE = ".snap_checkpoints.json"  # persisted per-file state
+
 recent_peaks = collections.deque(maxlen=5)
 last_trigger = 0
 is_fixing = False
@@ -84,6 +103,17 @@ _rag_signature = None    # fingerprint of the folder state the index was built f
 _rag_mode = "none"       # "embeddings" | "lexical" | "none"
 _rag_idf = {}            # token -> inverse document frequency weight
 _rag_corpus_size = 0     # number of indexed chunks (for default IDF)
+
+# Per-file chunk/embedding cache: abs_path -> {"mtime": float, "chunks": [...]}.
+# Lets build_rag_index() re-embed only the files that actually changed since
+# the last snap, instead of re-embedding the whole project every time (which
+# is what happens if you fingerprint the folder by mtime and then write back
+# to the very file you're fixing - its own mtime change looked identical to
+# "the whole project needs reindexing").
+_file_chunk_cache = {}
+
+# In-memory checkpoint cache; loaded from CHECKPOINT_STORE on first use.
+_checkpoints = None      # abs_path -> {"line": int, "prefix_hash": str}
 
 
 def get_latest_code_file(folder):
@@ -121,6 +151,91 @@ def get_latest_code_file(folder):
 
 
 # ---------------------------------------------------------------------------
+# Incremental checkpoints (only send new code after the last snap)
+# ---------------------------------------------------------------------------
+
+def _checkpoint_store_path():
+    return os.path.join(os.path.abspath(WATCH_FOLDER), CHECKPOINT_STORE)
+
+
+def _load_checkpoints():
+    global _checkpoints
+    if _checkpoints is not None:
+        return _checkpoints
+    path = _checkpoint_store_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            _checkpoints = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        _checkpoints = {}
+    return _checkpoints
+
+
+def _save_checkpoints():
+    if _checkpoints is None:
+        return
+    path = _checkpoint_store_path()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(_checkpoints, f, indent=2)
+
+
+def _prefix_hash(lines):
+    """Fingerprint of lines already processed, so edits before the checkpoint reset it."""
+    if not lines:
+        return ""
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
+def get_effective_checkpoint(path, lines):
+    """Return the line index where the next snap window should start."""
+    if not CHECKPOINT_ENABLED:
+        return 0
+
+    state = _load_checkpoints().get(os.path.abspath(path))
+    if not state:
+        return 0
+
+    cp = state.get("line", 0)
+    if cp <= 0 or cp > len(lines):
+        return 0
+
+    prefix = lines[:cp]
+    if _prefix_hash(prefix) != state.get("prefix_hash"):
+        print("[Checkpoint] Earlier code changed — resetting to line 1.")
+        return 0
+    return cp
+
+
+def set_checkpoint(path, line, lines):
+    """Record that lines[:line] have already been seen/fixed."""
+    if not CHECKPOINT_ENABLED:
+        return
+
+    store = _load_checkpoints()
+    store[os.path.abspath(path)] = {
+        "line": line,
+        "prefix_hash": _prefix_hash(lines[:line]),
+    }
+    _save_checkpoints()
+
+
+def extract_fix_window(lines, start_line):
+    """Return (start, end, window_text) for the next chunk Gemma should fix."""
+    if start_line >= len(lines):
+        return start_line, start_line, ""
+
+    end = min(len(lines), start_line + CHECKPOINT_MAX_LINES)
+    window = "\n".join(lines[start_line:end])
+    return start_line, end, window
+
+
+def merge_fixed_window(lines, start_line, fixed_text):
+    """Splice the corrected window back into the full file."""
+    fixed_lines = fixed_text.splitlines()
+    return lines[:start_line] + fixed_lines
+
+
+# ---------------------------------------------------------------------------
 # RAG pipeline (index -> retrieve -> augment prompt)
 # ---------------------------------------------------------------------------
 
@@ -140,17 +255,6 @@ def _iter_project_files(folder):
             except OSError:
                 continue
             yield path
-
-
-def _folder_signature(folder):
-    """Cheap fingerprint of the project state, so we only re-index when needed."""
-    parts = []
-    for path in sorted(_iter_project_files(folder)):
-        try:
-            parts.append(f"{path}:{os.path.getmtime(path)}")
-        except OSError:
-            continue
-    return "|".join(parts)
 
 
 def _chunk_file(path):
@@ -232,42 +336,73 @@ def _lexical_score(query_tokens, chunk_text, idf, corpus_size):
 
 
 def build_rag_index(folder):
-    """Build (or reuse) the chunk index for the project. Safe to call every snap."""
-    global _rag_index, _rag_signature, _rag_mode, _rag_idf, _rag_corpus_size
+    """Build (or reuse) the chunk index for the project. Safe to call every snap.
+
+    Only files whose mtime actually changed since the last build get
+    re-chunked and re-embedded; everything else is served from
+    _file_chunk_cache. This matters a lot in practice: fix_current_file()
+    writes the corrected file back to disk, which changes that file's mtime,
+    which would otherwise look identical to "the whole project changed" on
+    the very next snap and trigger a full project re-embed every time.
+    """
+    global _rag_index, _rag_signature, _rag_mode, _rag_idf, _rag_corpus_size, _file_chunk_cache
 
     if not RAG_ENABLED:
         _rag_index, _rag_mode = [], "none"
         return
 
-    signature = _folder_signature(folder)
+    current_files = {}
+    for path in _iter_project_files(folder):
+        try:
+            current_files[path] = os.path.getmtime(path)
+        except OSError:
+            continue
+
+    signature = "|".join(f"{p}:{m}" for p, m in sorted(current_files.items()))
     if signature == _rag_signature and _rag_index:
         return  # nothing changed since last build - reuse the cached index
 
-    chunks = []
-    for path in _iter_project_files(folder):
-        chunks.extend(_chunk_file(path))
+    all_chunks = []
+    new_chunks = []  # only the chunks that actually need embedding this round
+    for path, mtime in current_files.items():
+        cached = _file_chunk_cache.get(path)
+        if cached and cached["mtime"] == mtime:
+            all_chunks.extend(cached["chunks"])
+            continue
+        chunks = _chunk_file(path)
+        new_chunks.extend(chunks)
+        all_chunks.extend(chunks)
+        _file_chunk_cache[path] = {"mtime": mtime, "chunks": chunks}
 
-    if not chunks:
+    # drop cache entries for files that no longer exist in the project
+    for stale_path in set(_file_chunk_cache) - set(current_files):
+        del _file_chunk_cache[stale_path]
+
+    if not all_chunks:
         _rag_index, _rag_signature, _rag_mode = [], signature, "none"
         return
 
-    vectors = _embed_texts([c["text"] for c in chunks])
-    if vectors and len(vectors) == len(chunks):
-        for chunk, vector in zip(chunks, vectors):
-            norm = np.linalg.norm(vector)
-            chunk["vector"] = vector / norm if norm > 0 else vector
-        _rag_mode = "embeddings"
+    if new_chunks:
+        vectors = _embed_texts([c["text"] for c in new_chunks])
+        if vectors and len(vectors) == len(new_chunks):
+            for chunk, vector in zip(new_chunks, vectors):
+                norm = np.linalg.norm(vector)
+                chunk["vector"] = vector / norm if norm > 0 else vector
+            _rag_mode = "embeddings"
+        else:
+            _rag_mode = "lexical"
     else:
-        _rag_mode = "lexical"
+        # nothing new to embed - mode follows whatever the cached chunks already have
+        _rag_mode = "embeddings" if all(c.get("vector") is not None for c in all_chunks) else "lexical"
 
-    # IDF is always built - the lexical path is also the fallback if an
-    # embedding request fails later at query time.
-    _rag_idf, _rag_corpus_size = _build_idf(chunks)
+    # IDF is always rebuilt over the full corpus - it's cheap (no network call)
+    # and needs to reflect the current set of chunks either way.
+    _rag_idf, _rag_corpus_size = _build_idf(all_chunks)
 
-    _rag_index = chunks
+    _rag_index = all_chunks
     _rag_signature = signature
-    print(f"[RAG] Indexed {len(chunks)} chunks from "
-          f"{len(set(c['file'] for c in chunks))} files (mode: {_rag_mode})")
+    print(f"[RAG] Indexed {len(all_chunks)} chunks from {len(current_files)} files "
+          f"({len(new_chunks)} newly embedded, mode: {_rag_mode})")
 
 
 def retrieve_context(query_text, target_path, top_k=RAG_TOP_K):
@@ -323,19 +458,42 @@ def retrieve_context(query_text, target_path, top_k=RAG_TOP_K):
 # LLM call
 # ---------------------------------------------------------------------------
 
-def call_lm_studio_fix(code: str, language: str, context: str = "") -> str:
+def call_lm_studio_fix(
+    code: str,
+    language: str,
+    context: str = "",
+    *,
+    partial: bool = False,
+    line_start: int = 1,
+    line_end: int = 1,
+) -> str:
     """Send code to local Gemma via LM Studio's OpenAI-compatible API, return corrected code."""
-    system_prompt = (
-        f"You are a code-fixing assistant. You will be given {language} code. "
-        "Fix any syntax errors, compile errors, or obvious logic bugs. "
-        "Return ONLY the corrected full code. "
-        "Do not include explanations, comments about what you changed, or markdown code fences."
-    )
+    if partial:
+        system_prompt = (
+            f"You are a code-fixing assistant. You will be given a PORTION of {language} code "
+            f"(lines {line_start}–{line_end} of a larger file). "
+            "Earlier lines were already corrected in a previous pass. "
+            "Fix any syntax errors, compile errors, or obvious logic bugs in THIS portion only. "
+            "Return ONLY the corrected code for this portion — not the whole file. "
+            "Do not include explanations, comments about what you changed, or markdown code fences."
+        )
+    else:
+        system_prompt = (
+            f"You are a code-fixing assistant. You will be given {language} code. "
+            "Fix any syntax errors, compile errors, or obvious logic bugs. "
+            "Return ONLY the corrected full code. "
+            "Do not include explanations, comments about what you changed, or markdown code fences."
+        )
 
     user_content = code
-
     if context:
-        user_content += context
+        user_content += "\n\n" + context
+
+    # Scale the token budget to the size of the window instead of always
+    # allowing up to MAX_TOKENS_CEILING. A 10-line fix has no business being
+    # able to run generation out to 4096 tokens if the model doesn't stop
+    # cleanly - this caps the worst case without touching normal fixes.
+    max_tokens = min(MAX_TOKENS_CEILING, max(MAX_TOKENS_FLOOR, len(code.splitlines()) * MAX_TOKENS_PER_LINE))
 
     response = requests.post(
         LM_STUDIO_URL,
@@ -346,7 +504,7 @@ def call_lm_studio_fix(code: str, language: str, context: str = "") -> str:
                 {"role": "user", "content": user_content},
             ],
             "temperature": 0.2,
-            "max_tokens": 4096,
+            "max_tokens": max_tokens,
             "stream": False,
         },
         timeout=REQUEST_TIMEOUT,
@@ -419,20 +577,68 @@ def fix_current_file():
 
         open_in_editor(os.path.abspath(target))
 
+        lines = original_code.splitlines()
+        cp = get_effective_checkpoint(target, lines)
+        start, end, window = extract_fix_window(lines, cp)
+
+        if not window.strip():
+            print("[Checkpoint] Nothing new to fix after the last checkpoint.")
+            return
+
+        is_partial = CHECKPOINT_ENABLED and (cp > 0 or end < len(lines))
+        line_start = start + 1
+        line_end = end
+
+        if CHECKPOINT_ENABLED:
+            print(f"[Checkpoint] Sending lines {line_start}–{line_end} "
+                  f"({end - start} of {len(lines)} total)")
+
+        # Timed so you can see exactly where time is going per snap - watch
+        # the "index" number in particular; it should drop close to 0s on
+        # snaps where no OTHER file in the project changed.
+        t0 = time_module.time()
         build_rag_index(WATCH_FOLDER)
-        context = retrieve_context(original_code, target)
+        t1 = time_module.time()
+        context = retrieve_context(window, target)
+        t2 = time_module.time()
 
-        fixed_code = call_lm_studio_fix(original_code, language, context)
+        fixed_window = call_lm_studio_fix(
+            window,
+            language,
+            context,
+            partial=is_partial,
+            line_start=line_start,
+            line_end=line_end,
+        )
+        t3 = time_module.time()
+        print(f"[TIMING] index={t1 - t0:.1f}s  retrieve={t2 - t1:.1f}s  generate={t3 - t2:.1f}s")
 
-        if not fixed_code.strip():
+        if not fixed_window.strip():
             print("Model returned empty response, skipping write.")
             return
 
-        if fixed_code.strip() == original_code.strip():
-            print("[DEBUG] Model returned code identical to the original — nothing to write.")
+        if fixed_window.strip() == window.strip():
+            print("[DEBUG] Model returned code identical to the window — nothing to write.")
+            if CHECKPOINT_ENABLED:
+                set_checkpoint(target, end, lines)
             return
 
-        print(f"[DEBUG] original={len(original_code)} chars, fixed={len(fixed_code)} chars")
+        if CHECKPOINT_ENABLED and is_partial:
+            merged_lines = merge_fixed_window(lines, start, fixed_window)
+        else:
+            merged_lines = fixed_window.splitlines()
+
+        fixed_code = "\n".join(merged_lines)
+        if original_code.endswith("\n"):
+            fixed_code += "\n"
+
+        if CHECKPOINT_ENABLED:
+            new_checkpoint = start + len(fixed_window.splitlines())
+            set_checkpoint(target, new_checkpoint, merged_lines)
+            print(f"[Checkpoint] Advanced to line {new_checkpoint + 1}")
+
+        print(f"[DEBUG] window={len(window)} chars, fixed={len(fixed_window)} chars, "
+              f"file={len(original_code)} chars")
 
         backup_path = target + ".bak"
         shutil.copy(target, backup_path)
