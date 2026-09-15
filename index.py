@@ -25,7 +25,7 @@ COOLDOWN = 2.0
 
 REQUEST_TIMEOUT = 300  # seconds; generous so a slow first response never times out mid-demo
 
-WATCH_FOLDER = "."  # <-- change to the folder you'll be coding in during the demo
+WATCH_FOLDER = os.environ.get("SNAP_WATCH_FOLDER", ".")  # set by the VS Code extension; "." when run manually
 
 # If set to a filename (e.g. "main.py"), THAT exact file is always the target
 # for both reading (data sent to the AI) and writing (the correction) - no
@@ -142,7 +142,7 @@ def get_latest_code_file(folder):
 
     all_files = []
     for ext in LANGUAGE_MAP:
-        all_files.extend(glob.glob(os.path.join(folder, f"*{ext}")))
+        all_files.extend(glob.glob(os.path.join(folder, "**", f"*{ext}"), recursive=True))
 
     all_files = [f for f in all_files if is_candidate(f)]
     if not all_files:
@@ -701,7 +701,7 @@ def audio_callback(indata, frames, time, status):
         and (now - last_trigger) > COOLDOWN
     ):
         last_trigger = now
-        print(f"👆 Snap detected! (Peak: {peak:.3f}, Sharpness: {crest_factor:.1f}) — starting fix...")
+        print(f"Snap detected! (Peak: {peak:.3f}, Sharpness: {crest_factor:.1f}) — starting fix...")
         threading.Thread(target=fix_current_file, daemon=True).start()
 
 
